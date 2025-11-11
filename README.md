@@ -42,7 +42,6 @@ pip install -r requirements.txt
 Gå inn i `nve_data/`-mappen og kjør alle skriptene for å hente ned og lagre alle metadata om elver, innsjøer og anlegg i både .csv og .jsonl format:
 
 ```bash
-cd nve_data
 python lastned_nve_solkraft.py
 python lastned_nve_vannkraftverk.py
 python lastned_nve_varme.py
@@ -51,7 +50,6 @@ python lastned_nve_elvenett_del1.py
 python lastned_nve_elvenett_del2.py
 python lastned_nve_havvind.py
 python lastned_nve_innsjøer.py
-cd ..
 ```
 
 ---
