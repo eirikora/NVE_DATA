@@ -1,85 +1,256 @@
 #!/usr/bin/env python3
 """
-Hent alle vannkraftverk fra NVE (Vannkraft1 – lag 0)
-og lagre som:
-  • vannkraftverk.jsonl   (én rad per linje, UTF-8)
-  • vannkraftverk.csv     (samme innhold)
-
-Kolonner:
-  vannkraftverkNr, vannkraftverkNavn, kommunenummer, kommuneNavn, fylke,
-  konsesjonStatus, status, idriftsattAar,
-  maksYtelse_MW, midlereProduksjon_GWh, bruttoFallhoyde_m,
-  domene, lat, lon
+Last ned alle vannkraftverk-objekter fra NVE Vannkraft1-tjenesten.
+Robust mot manglende 'centroid' og sikrer at OBJECTID alltid er tilgjengelig.
 """
 
+from __future__ import annotations
+import csv, json, sys, time
 from pathlib import Path
-import csv, json, time, requests
+from typing import List, Dict
 
-# ────────────────────────────────────────────────────────────────────────
-SERVICE = "https://nve.geodataonline.no/arcgis/rest/services/Vannkraft1/MapServer"
-LAYER   = 0
-URL     = f"{SERVICE}/{LAYER}/query"
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Feltene vi vil TA MED i de ferdige filene (rekkefølgen bevares)
-KEEP = [
-    "vannkraftverkNr", "vannkraftverkNavn",
-    "kommunenummer", "kommuneNavn", "fylke",
-    "konsesjonStatus", "status",
-    "idriftsattAar",
-    "maksYtelse_MW",            # finnes, men er ofte 0 – behold likevel
-    "midlereProduksjon_GWh",
-    "bruttoFallhoyde_m",
+SERVICE = ("https://nve.geodataonline.no/arcgis/rest/services/"
+           "Vannkraft1/MapServer/0/query")  # Vannkraftverk layer (layer 0)
+BATCH = 100
+TIMEOUT = (10, 180)
+PAUSE = 0.25
+
+FIELDS: List[str] = [
+    "OBJECTID", "objektType", "vannkraftverkNr", "vannkraftverkNavn", "vannkraftverkType",
+    "medium", "status", "idriftsattAar", "kdbNr", "konsesjonStatus",
+    "konsesjonStatusDato", "SpID", "maksYtelse_MW", "bruttoFallhoyde_m",
+    "energiEkvivalent_kWh_m3", "vannkraftverkEier", "kommunenummer",
+    "kommuneNavn", "fylke", "vassdragsNr", "elvenavnHierarki",
+    "nedstromVannkraftverkNr", "nedstromVannkraftverkNr_Liste", "kraftverkSymbol"
 ]
 
-# permanente filnavn
-OUT_JSONL = Path("vannkraftverk.jsonl")
-OUT_CSV   = Path("vannkraftverk.csv")
-# ────────────────────────────────────────────────────────────────────────
+JSONL = Path("vannkraftverk.jsonl")
+CSV   = Path("vannkraftverk.csv")
+OIDS  = Path("resume_vannkraftverk_oid.txt")
 
-PARAMS_BASE = {
-    "where": "1=1",
-    "outFields": "*",           # <- sikker mot stavefeil
-    "returnGeometry": "true",
-    "outSR": 4326,              # lat/lon
-    "f": "json",
-    "resultRecordCount": 1000,
-}
 
-rows, offset = [], 0
-while True:
-    rsp = requests.get(URL, params=PARAMS_BASE | {"resultOffset": offset},
-                       timeout=60)
-    rsp.raise_for_status()
-    data = rsp.json()
-    if "error" in data:
-        raise RuntimeError(data["error"])
+def make_session(retries=5, backoff=1.0) -> requests.Session:
+    retry = Retry(total=retries, backoff_factor=backoff,
+                  status_forcelist=(500, 502, 503, 504),
+                  allowed_methods={"GET"})
+    s = requests.Session()
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers.update({"User-Agent": "NVE-vannkraftverk-downloader/1.0"})
+    return s
 
-    feats = data["features"]
-    for f in feats:
-        a = f["attributes"]
-        # bygg ny dict med bare ønskede felt (empty hvis mangler)
-        row = {k: a.get(k) for k in KEEP}
-        row["domene"] = "Vannkraft"
-        row["lat"] = f["geometry"]["y"]
-        row["lon"] = f["geometry"]["x"]
-        rows.append(row)
 
-    print(f"{offset:>6}  +{len(feats):>4}  →  {len(rows):>6} kraftverk")
-    if len(feats) < PARAMS_BASE["resultRecordCount"]:
-        break
-    offset += PARAMS_BASE["resultRecordCount"]
-    time.sleep(0.25)
+session = make_session()
 
-# ── Lagre JSON Lines ────────────────────────────────────────────────────
-with OUT_JSONL.open("w", encoding="utf-8") as jf:
-    for r in rows:
-        jf.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-# ── Lagre CSV ───────────────────────────────────────────────────────────
-field_order = KEEP + ["domene", "lat", "lon"]
-with OUT_CSV.open("w", newline="", encoding="utf-8") as cf:
-    w = csv.DictWriter(cf, fieldnames=field_order)
-    w.writeheader()
-    w.writerows(rows)
+def get_layer_meta() -> dict:
+    r = session.get(SERVICE.rsplit("/", 1)[0], params={"f": "json"},
+                    timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
-print(f"\n✅  Ferdig! Lagret {len(rows)} kraftverk som {OUT_JSONL} og {OUT_CSV}")
+
+def resolve_oid_field(meta: dict) -> str:
+    return (meta.get("objectIdField") or
+            meta.get("objectIdFieldName") or
+            next(f["name"] for f in meta["fields"]
+                 if f["type"] == "esriFieldTypeOID"))
+
+
+def get_total_count() -> int:
+    r = session.get(
+        SERVICE,
+        params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()["count"]
+
+
+def load_resume_oid() -> int:
+    try:
+        return int(OIDS.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def save_resume_oid(oid: int) -> None:
+    OIDS.write_text(str(oid))
+
+
+def already_downloaded() -> set[int]:
+    """Return set of already downloaded OBJECTIDs"""
+    ids = set()
+    if JSONL.exists():
+        with JSONL.open(encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+                try:
+                    data = json.loads(line)
+                    # Use OBJECTID as deduplication key
+                    object_id = data.get("OBJECTID")
+                    if object_id is not None:
+                        ids.add(object_id)
+                except Exception as e:
+                    print(f"Warning: Could not parse line {line_num} in {JSONL}: {e}")
+    return ids
+
+
+def centroid_from_geometry(geom: dict) -> tuple[float, float] | None:
+    if not geom:
+        return None
+    if "x" in geom and "y" in geom:          # punkt
+        return geom["y"], geom["x"]
+    if "paths" in geom:                      # line (polyline)
+        xmin = ymin = float("inf")
+        xmax = ymax = -float("inf")
+        for path in geom["paths"]:
+            for x, y in path:
+                xmin, xmax = min(xmin, x), max(xmax, x)
+                ymin, ymax = min(ymin, y), max(ymax, y)
+        return (ymin + ymax) / 2, (xmin + xmax) / 2
+    if "rings" in geom:                      # polygon
+        xmin = ymin = float("inf")
+        xmax = ymax = -float("inf")
+        for ring in geom["rings"]:
+            for x, y in ring:
+                xmin, xmax = min(xmin, x), max(xmax, x)
+                ymin, ymax = min(ymin, y), max(ymax, y)
+        return (ymin + ymax) / 2, (xmin + xmax) / 2
+    return None
+
+
+def query_next_batch(oid_field: str, last_oid: int) -> List[dict]:
+    out_fields = FIELDS + [oid_field] if oid_field not in FIELDS else FIELDS
+    params = {
+        "where": f"{oid_field}>{last_oid}",
+        "outFields": ",".join(out_fields),
+        "orderByFields": f"{oid_field} ASC",
+        "returnGeometry": "true",
+        "geometryPrecision": 5,
+        "outSR": 4326,
+        "resultRecordCount": BATCH,
+        "f": "json",
+    }
+    r = session.get(SERVICE, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    response_data = r.json()
+
+    # Debug: print response if features is missing
+    if "features" not in response_data:
+        print(f"DEBUG: Unexpected API response: {response_data}")
+        if "error" in response_data:
+            print(f"API Error: {response_data['error']}")
+        return []
+
+    features = response_data["features"]
+    return features
+
+
+def write_csv_row(row: Dict, first: bool) -> None:
+    mode = "a" if CSV.exists() else "w"
+    with CSV.open(mode, newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=row.keys())
+        if first:
+            w.writeheader()
+        w.writerow(row)
+
+
+def main() -> None:
+    meta = get_layer_meta()
+    oid_field = resolve_oid_field(meta)
+    total = get_total_count()
+    print(f"ℹ️  OID-felt er «{oid_field}»")
+    print(f"ℹ️  API melder om {total:,} vannkraftverk totalt")
+
+    seen = already_downloaded()
+    print(f"🔄  Fant {len(seen):,} vannkraftverk fra før – fortsetter …")
+
+    last_oid = load_resume_oid()
+    first_csv = not CSV.exists()
+
+    while True:
+        feats = query_next_batch(oid_field, last_oid)
+        if not feats:
+            print("No more features returned, ending download.")
+            break
+
+        buffer: List[str] = []
+        processed_count = 0
+
+        for feat in feats:
+            attr = feat["attributes"]
+            # Use OBJECTID as deduplication key
+            object_id = attr.get(oid_field)
+            if object_id is None:
+                print(f"Warning: {oid_field} missing in feature, skipping")
+                continue
+
+            if object_id in seen:
+                if last_oid < 20:  # Only debug first few
+                    print(f"DEBUG: Skipping OBJECTID {object_id} - already seen")
+                last_oid = object_id
+                continue
+
+            # -- koordinater --
+            if "centroid" in feat:
+                lat, lon = feat["centroid"]["y"], feat["centroid"]["x"]
+            else:
+                res = centroid_from_geometry(feat.get("geometry"))
+                if res is None:
+                    if last_oid < 20:
+                        print(f"DEBUG: No coordinates for OBJECTID {object_id}, skipping")
+                    continue
+                lat, lon = res
+            # -----------------
+
+            attr |= {"lat": lat, "lon": lon}
+
+            # Keep OBJECTID in the data for deduplication on resume
+            last_oid = object_id
+
+            seen.add(object_id)
+            buffer.append(json.dumps(attr, ensure_ascii=False) + "\n")
+            write_csv_row(attr, first_csv)
+            first_csv = False
+            processed_count += 1
+
+        with JSONL.open("a", encoding="utf-8") as jf:
+            jf.writelines(buffer)
+
+        # Always update last_oid to avoid infinite loops
+        if feats:
+            max_oid_in_batch = max(feat["attributes"].get(oid_field, 0) for feat in feats)
+            if max_oid_in_batch > last_oid:
+                last_oid = max_oid_in_batch
+
+        save_resume_oid(last_oid)
+        print(f"{last_oid:>9} OID → +{len(buffer):4} processed:{processed_count:4} "
+              f"({len(seen):,}/{total:,})")
+        time.sleep(PAUSE)
+
+        # Break if no new records processed to avoid infinite loops
+        if processed_count == 0 and len(feats) > 0:
+            print("No new records processed but features returned. Possible duplicate handling issue.")
+            break
+
+        if len(seen) >= total:
+            break
+
+    if len(seen) >= total:
+        print(f"\n✅  Alle {total:,} vannkraftverk lastet ned.")
+    else:
+        print(f"\n⚠️  Avsluttet før fullført – har {len(seen):,} av "
+              f"{total:,}.  Kjør igjen for å fortsette.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\n⏹️  Avbrutt av bruker.")

@@ -200,7 +200,8 @@ def main() -> None:
 
             attr |= {"center_lat": lat, "center_lon": lon}
 
-            oid_val = attr.pop(oid_field, None)   # fjern før skriving
+            # Keep OBJECTID in the data for deduplication
+            oid_val = attr.get(oid_field)
             if oid_val is not None:
                 last_oid = oid_val
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Last ned alle dam-objekter fra NVE Vannkraft1-tjenesten.
+Last ned alle vannvei-objekter fra NVE Vannkraft1-tjenesten.
 Robust mot manglende 'centroid' og sikrer at OBJECTID alltid er tilgjengelig.
 """
 
@@ -14,22 +14,20 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 SERVICE = ("https://nve.geodataonline.no/arcgis/rest/services/"
-           "Vannkraft1/MapServer/5/query")  # Dam layer (layer 5)
+           "Vannkraft1/MapServer/4/query")  # Vannvei layer (layer 4)
 BATCH = 100
 TIMEOUT = (10, 180)
 PAUSE = 0.25
 
 FIELDS: List[str] = [
-    "damNr", "damNavn", "objektType", "damKategori", "damFunksjon",
-    "damHovedType", "status", "kommunenummer", "kommuneNavn", "fylke",
-    "vassdragsNr", "idriftsattAar", "volumOppdemt_Mm3", "hohDamTopp",
-    "damAnsvarlig", "vannkraftverkNavn", "vannkraftverkNr", "konsesjonStatus",
-    "magasinNr", "magasinNavn"
+    "OBJECTID", "objektType", "vannveiID", "medium", "status", "idriftsattAar",
+    "kdbNr", "konsesjonStatus", "konsesjonStatusDato", "SpID",
+    "vannveiLengde_m", "vannkraftverkNr", "vannkraftverkNavn"
 ]
 
-JSONL = Path("dammer.jsonl")
-CSV   = Path("dammer.csv")
-OIDS  = Path("resume_dam_oid.txt")
+JSONL = Path("vannveier.jsonl")
+CSV   = Path("vannveier.csv")
+OIDS  = Path("resume_vannvei_oid.txt")
 
 
 def make_session(retries=5, backoff=1.0) -> requests.Session:
@@ -38,7 +36,7 @@ def make_session(retries=5, backoff=1.0) -> requests.Session:
                   allowed_methods={"GET"})
     s = requests.Session()
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "NVE-dam-downloader/1.0"})
+    s.headers.update({"User-Agent": "NVE-vannvei-downloader/1.0"})
     return s
 
 
@@ -81,6 +79,7 @@ def save_resume_oid(oid: int) -> None:
 
 
 def already_downloaded() -> set[int]:
+    """Return set of already downloaded OBJECTIDs (not vannveiID, since many are null)"""
     ids = set()
     if JSONL.exists():
         with JSONL.open(encoding="utf-8") as f:
@@ -90,9 +89,10 @@ def already_downloaded() -> set[int]:
                     continue
                 try:
                     data = json.loads(line)
-                    dam_nr = data.get("damNr")
-                    if dam_nr is not None:
-                        ids.add(dam_nr)
+                    # Use OBJECTID as deduplication key since vannveiID can be null
+                    object_id = data.get("OBJECTID")
+                    if object_id is not None:
+                        ids.add(object_id)
                 except Exception as e:
                     print(f"Warning: Could not parse line {line_num} in {JSONL}: {e}")
     return ids
@@ -134,10 +134,6 @@ def query_next_batch(oid_field: str, last_oid: int) -> List[dict]:
         "resultRecordCount": BATCH,
         "f": "json",
     }
-
-    # Debug: print query details for first few calls
-    # print(f"DEBUG: Querying {oid_field}>{last_oid}, expecting up to {BATCH} records")
-
     r = session.get(SERVICE, params=params, timeout=TIMEOUT)
     r.raise_for_status()
     response_data = r.json()
@@ -150,8 +146,6 @@ def query_next_batch(oid_field: str, last_oid: int) -> List[dict]:
         return []
 
     features = response_data["features"]
-    # print(f"DEBUG: Got {len(features)} features, OID range: {features[0]['attributes'].get(oid_field) if features else 'N/A'} - {features[-1]['attributes'].get(oid_field) if features else 'N/A'}")
-
     return features
 
 
@@ -169,12 +163,10 @@ def main() -> None:
     oid_field = resolve_oid_field(meta)
     total = get_total_count()
     print(f"ℹ️  OID-felt er «{oid_field}»")
-    print(f"ℹ️  API melder om {total:,} dammer totalt")
+    print(f"ℹ️  API melder om {total:,} vannveier totalt")
 
     seen = already_downloaded()
-    print(f"🔄  Fant {len(seen):,} dammer fra før – fortsetter …")
-    if len(seen) > 0 and len(seen) < 20:
-        print(f"DEBUG: Existing damNr values: {sorted(seen)}")
+    print(f"🔄  Fant {len(seen):,} vannveier fra før – fortsetter …")
 
     last_oid = load_resume_oid()
     first_csv = not CSV.exists()
@@ -188,43 +180,38 @@ def main() -> None:
         buffer: List[str] = []
         processed_count = 0
 
-        # if last_oid < 20:
-        #     print(f"DEBUG: Processing {len(feats)} features, seen set has {len(seen)} items")
-
         for feat in feats:
             attr = feat["attributes"]
-            # Handle missing damNr field gracefully
-            dam_nr = attr.get("damNr")
-            if dam_nr is None:
-                if last_oid < 20:  # Only debug first few
-                    print(f"Warning: damNr missing in feature OID {attr.get('OBJECTID')}")
-                continue
-            if dam_nr in seen:
-                if last_oid < 20:  # Only debug first few
-                    print(f"DEBUG: Skipping damNr {dam_nr} - already seen")
-                last_oid = attr.get(oid_field, last_oid)
+            # Use OBJECTID as deduplication key (vannveiID can be null for many features)
+            object_id = attr.get(oid_field)
+            if object_id is None:
+                print(f"Warning: {oid_field} missing in feature, skipping")
                 continue
 
-            # -- koordinater --
+            if object_id in seen:
+                if last_oid < 20:  # Only debug first few
+                    print(f"DEBUG: Skipping OBJECTID {object_id} - already seen")
+                last_oid = object_id
+                continue
+
+            # -- koordinater (midtpunkt av linjen) --
             if "centroid" in feat:
                 lat, lon = feat["centroid"]["y"], feat["centroid"]["x"]
             else:
                 res = centroid_from_geometry(feat.get("geometry"))
                 if res is None:
                     if last_oid < 20:
-                        print(f"DEBUG: No coordinates for damNr {dam_nr}, skipping")
+                        print(f"DEBUG: No coordinates for OBJECTID {object_id}, skipping")
                     continue
                 lat, lon = res
             # -----------------
 
-            attr |= {"lat": lat, "lon": lon}
+            attr |= {"center_lat": lat, "center_lon": lon}
 
-            # Keep OBJECTID in the data for deduplication
-            oid_val = attr.get(oid_field)
-            if oid_val is not None:
-                last_oid = oid_val
+            # Keep OBJECTID in the data for deduplication on resume
+            last_oid = object_id
 
-            seen.add(dam_nr)
+            seen.add(object_id)
             buffer.append(json.dumps(attr, ensure_ascii=False) + "\n")
             write_csv_row(attr, first_csv)
             first_csv = False
@@ -253,7 +240,7 @@ def main() -> None:
             break
 
     if len(seen) >= total:
-        print(f"\n✅  Alle {total:,} dammer lastet ned.")
+        print(f"\n✅  Alle {total:,} vannveier lastet ned.")
     else:
         print(f"\n⚠️  Avsluttet før fullført – har {len(seen):,} av "
               f"{total:,}.  Kjør igjen for å fortsette.")
