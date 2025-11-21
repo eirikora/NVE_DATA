@@ -22,7 +22,10 @@ PAUSE = 0.25
 FIELDS: List[str] = [
     "vatnLnr", "navn", "kommNr", "kommune",
     "hoyde", "areal_km2",
-    "objektType", "magasinNr"
+    "objektType", "magasinNr", "magKategori", "magFormal_Liste",
+    "vassdragsNr", "elvenavnHierarki", "vassOmr",
+    "grensesjo", "land1", "land2", "arealNorge_km2",
+    "antallKommuner", "dybdekart", "nedborfeltareal_km2"
 ]
 
 JSONL = Path("innsjoe_full.jsonl")
