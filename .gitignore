@@ -5,7 +5,7 @@ design.pptx
 *.jsonl
 *.json
 *.csv
-resume_oid.txt
+resume*.txt
 *.pdf
 *.md
 !README.md
