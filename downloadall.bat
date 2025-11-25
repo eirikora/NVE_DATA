@@ -1,3 +1,6 @@
+python lastned_nve_andre_inntak.py
+python lastned_nve_andre_utlop.py
+python lastned_nve_andre_vassdragsanlegg.py
 python lastned_nve_dammer.py
 # python lastned_nve_delfelt.py
 # python lastned_nve_elvenett_del1.py
