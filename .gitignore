@@ -18,4 +18,5 @@ resume*.txt
 __pycache__/
 test
 test/*
+resume_*.txt
 !ending_map.json

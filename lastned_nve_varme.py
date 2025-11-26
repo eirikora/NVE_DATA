@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Last ned alle aktuelle lag (1–6) fra NVE «Varme» og lagre hvert lag som
- • varme_lag{N}.jsonl
- • varme_lag{N}.csv
+Last ned alle aktuelle lag (1–6) fra NVE «Varme» og lagre som én samlet fil:
+ • varmeanlegg.jsonl
+ • varmeanlegg.csv
 
 Lag 0 gir 400-feil – hoppes over.
 """
@@ -14,16 +14,16 @@ BASE = "https://nve.geodataonline.no/arcgis/rest/services/Mapservices/Varme/MapS
 
 # ─── Hvilke felter vi vil beholde fra hvert lag ──────────────────────────
 KEEP = {
-    1: ["anlegg", "eier", "kommune"],
-    2: ["aktor", "dagensInstallerteEffekt_MW", "navn", "sted", "typeSenter"],
-    3: ["navn", "eier", "kapasitet"],
-    4: ["Anlegg", "Kommune", "Selskap", "Summert"],
-    5: ["Anlegg", "Kommune", "Selskap", "Summert"],
-    6: ["Anlegg", "Kommune", "Selskap", "Summert"],
+    1: ["OBJECTID", "anlegg", "eier", "kommune"],
+    2: ["OBJECTID", "aktor", "dagensInstallerteEffekt_MW", "navn", "sted", "typeSenter"],
+    3: ["OBJECTID", "navn", "eier", "kapasitet"],
+    4: ["OBJECTID", "Anlegg", "Kommune", "Selskap", "Summert"],
+    5: ["OBJECTID", "Anlegg", "Kommune", "Selskap", "Summert"],
+    6: ["OBJECTID", "Anlegg", "Kommune", "Selskap", "Summert"],
 }
 
-# lag-beskrivelse legges i filnavnet og i domene-feltet
-DESCR = {
+# lag-type legges som varmeType-felt i hver record
+VARME_TYPE = {
     1: "industri",
     2: "datasenter",
     3: "avfallsforbrenning",
@@ -51,25 +51,26 @@ def centroid_from_rings(rings):
             n += 1
     return (sy / n, sx / n) if n else (None, None)
 
+# Samle alle anlegg i én liste
+all_rows = []
+
 for layer in range(1, 7):               # lag 1–6
     url = f"{BASE}/{layer}/query"
     keep = KEEP[layer]
-    desc = DESCR[layer]
+    varme_type = VARME_TYPE[layer]
 
-    rows, offset = [], 0
+    offset = 0
     while True:
         rsp = requests.get(url, params=PARAMS | {"resultOffset": offset}, timeout=60)
         try:
             rsp.raise_for_status()
         except Exception as e:
             print(f"⚠️  Lag {layer}: HTTP-feil {e}; hopper over dette laget.")
-            rows = []
             break
 
         data = rsp.json()
         if "error" in data:
             print(f"⚠️  Lag {layer}: {data['error']}; hopper over.")
-            rows = []
             break
 
         feats = data.get("features", [])
@@ -77,7 +78,7 @@ for layer in range(1, 7):               # lag 1–6
             a = f.get("attributes", {})
 
             row = {k: a.get(k) for k in keep}  # ønskede felter
-            row["domene"] = f"Varme_{desc}"    # domene for sporbarhet
+            row["varmeType"] = varme_type      # legg til type
 
             geom = f.get("geometry", {}) or {}
             if "x" in geom and "y" in geom:    # punktlag
@@ -85,32 +86,39 @@ for layer in range(1, 7):               # lag 1–6
             else:                              # polygon – beregn centroid
                 row["lat"], row["lon"] = centroid_from_rings(geom.get("rings"))
 
-            rows.append(row)
+            all_rows.append(row)
 
-        print(f" Lag {layer} – offset {offset:>5}  +{len(feats):>4}  →  {len(rows)}")
+        print(f" Lag {layer} ({varme_type}) – offset {offset:>5}  +{len(feats):>4}  →  {len(all_rows)} totalt")
 
         if len(feats) < PARAMS["resultRecordCount"]:
             break
         offset += PARAMS["resultRecordCount"]
         time.sleep(0.25)
 
-    # hopp over lag som feilet
-    if not rows:
-        continue
-
-    # ── Skriv filer ────────────────────────────────────────────────────
-    stem = f"varme_lag{layer}_{desc}"
-    out_jsonl = Path(f"{stem}.jsonl")
-    out_csv   = Path(f"{stem}.csv")
+# ── Skriv samlede filer ────────────────────────────────────────────────────
+if all_rows:
+    out_jsonl = Path("varmeanlegg.jsonl")
+    out_csv   = Path("varmeanlegg.csv")
 
     with out_jsonl.open("w", encoding="utf-8") as jf:
-        for r in rows:
+        for r in all_rows:
             jf.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    field_order = keep + ["domene", "lat", "lon"]
+    # Finn alle unike felt fra alle lag
+    all_fields = set()
+    for r in all_rows:
+        all_fields.update(r.keys())
+
+    # Ordne feltene: OBJECTID først, varmeType, så resten, lat/lon sist
+    field_order = ["OBJECTID", "varmeType"]
+    field_order += sorted([f for f in all_fields if f not in ["OBJECTID", "varmeType", "lat", "lon"]])
+    field_order += ["lat", "lon"]
+
     with out_csv.open("w", newline="", encoding="utf-8") as cf:
         w = csv.DictWriter(cf, fieldnames=field_order)
         w.writeheader()
-        w.writerows(rows)
+        w.writerows(all_rows)
 
-    print(f"✅  Lag {layer}: lagret {len(rows)} rader til {out_jsonl} / {out_csv}\n")
+    print(f"\n✅  Totalt {len(all_rows)} varmeanlegg lagret til {out_jsonl} / {out_csv}")
+else:
+    print("\n⚠️  Ingen varmeanlegg lastet ned")
