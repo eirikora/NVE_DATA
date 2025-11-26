@@ -20,3 +20,4 @@ test
 test/*
 resume_*.txt
 !ending_map.json
+!anleggsreg_prefix.csv
