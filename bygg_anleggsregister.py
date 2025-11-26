@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List
 
 PREFIX_CONFIG = Path("anleggsreg_prefix.csv")
-OUTPUT_FILE = Path("anleggsregister.jsonl")
+OUTPUT_FILE = Path("ANLEGGSREGISTER_NVE.jsonl")
 
 
 def load_prefix_config() -> List[Dict[str, str]]:
