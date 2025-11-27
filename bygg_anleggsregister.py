@@ -55,6 +55,37 @@ def process_file(fil: str, prefix: str, tema: str, id_felt: str) -> int:
                 # Hent ID-verdi
                 id_value = record.get(id_felt)
 
+                # Spesialhåndtering: varmeanlegg - bruk lagnr * 10000 + OBJECTID
+                if id_felt == "OBJECTID" and fil == "varmeanlegg.jsonl":
+                    # Map varmeType til lagnr
+                    varme_type_to_lag = {
+                        "industri": 1,
+                        "datasenter": 2,
+                        "avfallsforbrenning": 3,
+                        "fjernvarme_konsesjon": 4,
+                        "fjernvarme_effekt": 5,
+                        "fjernvarme_produksjon": 6,
+                    }
+                    varme_type = record.get("varmeType")
+                    lagnr = varme_type_to_lag.get(varme_type, 0)
+                    objectid = record.get("OBJECTID")
+
+                    if objectid is not None and lagnr > 0:
+                        id_value = lagnr * 10000 + objectid
+                        record["_generert_id"] = id_value
+                        record["_lagnr"] = lagnr
+
+                # Spesialhåndtering: magasinNr med fallback til OBJECTID + 50000
+                # Gjelder både null og 0 (0 er ekvivalent med null)
+                if id_felt == "magasinNr" and fil == "ikke_utbygd_magasin.jsonl":
+                    if id_value is None or id_value == 0:
+                        objectid = record.get("OBJECTID")
+                        if objectid is not None:
+                            id_value = objectid + 50000
+                            # Marker at dette er en generert ID
+                            record["_generert_magasinNr"] = id_value
+                            record["_original_magasinNr"] = record.get("magasinNr")
+
                 if id_value is None:
                     print(f"  ⚠️  {fil}:{line_num} mangler {id_felt}, hopper over")
                     skipped += 1
