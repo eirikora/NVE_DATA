@@ -30,7 +30,7 @@ def load_prefix_config() -> List[Dict[str, str]]:
     return config
 
 
-def process_file(fil: str, prefix: str, tema: str, id_felt: str) -> int:
+def process_file(fil: str, prefix: str, tema: str, id_felt: str, seen_gids: set) -> int:
     """Prosesser en JSONL-fil og skriv til anleggsregister med GID"""
     file_path = Path(fil)
 
@@ -40,6 +40,7 @@ def process_file(fil: str, prefix: str, tema: str, id_felt: str) -> int:
 
     count = 0
     skipped = 0
+    duplicates = 0
 
     with file_path.open(encoding="utf-8") as infile, \
          OUTPUT_FILE.open("a", encoding="utf-8") as outfile:
@@ -94,6 +95,14 @@ def process_file(fil: str, prefix: str, tema: str, id_felt: str) -> int:
                 # Lag GID
                 gid = f"{prefix}.{id_value}"
 
+                # Sjekk om GID allerede er brukt (duplikat)
+                if gid in seen_gids:
+                    duplicates += 1
+                    continue
+
+                # Marker GID som brukt
+                seen_gids.add(gid)
+
                 # Bygg ny ordnet dict med AnleggsType først, GID andre
                 ordered_record = {
                     "AnleggsType": tema,
@@ -120,8 +129,15 @@ def process_file(fil: str, prefix: str, tema: str, id_felt: str) -> int:
                 print(f"  ⚠️  {fil}:{line_num} Feil: {e}")
                 skipped += 1
 
+    # Bygg statusmelding
+    status_parts = []
     if skipped > 0:
-        print(f"  ✓  {fil}: {count:,} records (+{skipped} hoppet over)")
+        status_parts.append(f"{skipped} hoppet over")
+    if duplicates > 0:
+        status_parts.append(f"{duplicates} duplikater")
+
+    if status_parts:
+        print(f"  ✓  {fil}: {count:,} records (+{', '.join(status_parts)})")
     else:
         print(f"  ✓  {fil}: {count:,} records")
 
@@ -150,6 +166,7 @@ def main() -> None:
     # Prosesser hver fil
     total_records = 0
     processed_files = 0
+    seen_gids = set()  # Hold styr på alle GID-er på tvers av filer
 
     for item in config:
         prefix = item["prefix"]
@@ -157,7 +174,7 @@ def main() -> None:
         fil = item["fil"]
         id_felt = item["id_felt"]
 
-        count = process_file(fil, prefix, tema, id_felt)
+        count = process_file(fil, prefix, tema, id_felt, seen_gids)
         if count > 0:
             processed_files += 1
         total_records += count
